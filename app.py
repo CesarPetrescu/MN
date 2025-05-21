@@ -21,6 +21,7 @@ import numpy  as np
 import scipy.linalg
 import configparser # Import configparser for configuration file reading
 import os           # Import os for path checking
+from collections import defaultdict, deque
 
 # Make NumPy print options more readable for debugging
 np.set_printoptions(precision=3, suppress=True, linewidth=200)
@@ -607,6 +608,16 @@ class App:
         self.animate_ac = False
         self.sim_time = 0.0 # Time in seconds for animation
 
+        # ───────── NEW "LIVE GRAPH" STATE ──────────
+        self.show_graph_popup = False          # toggled with G
+        self.graph_history_s  = 5.0            # seconds to keep
+        self.graph_samples_hz = 60             # sampling rate
+        self._next_sample_t   = 0.0            # internal timer
+        #  history[(comp, 'V'|'I')]  → deque of (t, value)
+        self.history = defaultdict(
+                lambda: deque(maxlen=int(self.graph_history_s *
+                                     self.graph_samples_hz)))
+
         # Updated initial status with new shortcuts
         self.status = "Drag parts to start. (T=Legend, U=LU View, A=Animate AC)"
         self.freq = 0.0
@@ -672,9 +683,11 @@ class App:
             self.handle_events()
 
             # --- Update Simulation Time for Animation ---
-            # Only update time if animation is active and frequency is meaningful
-            if self.animate_ac and self.freq > 0:
+            # Only update time if animation is active or graph popup is shown
+            # and the frequency is meaningful (AC analysis)
+            if self.freq > 0 and (self.animate_ac or self.show_graph_popup):
                  self.sim_time += dt
+                 self._maybe_sample_live_waveforms()
                  # Optional: Reset sim_time periodically to prevent floating point issues over very long runs
                  # A few periods are enough for visual effect
                  # if self.freq > 0:
@@ -693,6 +706,13 @@ class App:
             if e.type == pg.QUIT:
                 pg.quit()
                 sys.exit()
+
+            # Handle events for the live graph popup
+            if self.show_graph_popup:
+                if e.type == pg.KEYDOWN and e.key in (pg.K_ESCAPE, pg.K_g):
+                    self.show_graph_popup = False
+                    self.status = "Graph closed."
+                    continue
 
             # Handle events specific to the LU popup first
             if self.show_lu_popup:
@@ -763,6 +783,15 @@ class App:
                             self.show_help = False; self.show_page=0 # Close other overlays
                             self.animate_ac = False # Stop animation
                     else: self.status = "Solve first (S) to view LU factors."
+
+                elif e.key == pg.K_g:                     # NEW – Graph popup
+                    self.show_graph_popup = not self.show_graph_popup
+                    if self.show_graph_popup:
+                        self.show_help = False; self.show_lu_popup = False
+                        self.animate_ac = False  # Stop animation when graph opens
+                        self.status = "Live graph view (G to close)"
+                    else:
+                        self.status = "Graph closed."
 
                 elif e.key == pg.K_c: # Toggle Edit Values mode
                     self.mode_edit = not self.mode_edit
@@ -1119,9 +1148,14 @@ class App:
         self.draw_info_bar()
 
         # Draw overlays/popups on top
-        if self.show_lu_popup: self.draw_lu_popup_overlay()
-        elif self.show_help: self.draw_legend()
-        else: self.draw_mini_legend() # Mini legend is shown by default
+        if self.show_graph_popup:
+            self.draw_live_graph_popup()
+        elif self.show_lu_popup:
+            self.draw_lu_popup_overlay()
+        elif self.show_help:
+            self.draw_legend()
+        else:
+            self.draw_mini_legend() # Mini legend is shown by default
 
         pg.display.flip() # Update the full screen
 
@@ -2225,6 +2259,140 @@ class App:
 
         # Blit the popup surface onto the main screen
         self.scr.blit(popup_surf, (popup_x, popup_y));
+
+
+    # ───────── Live graph popup ──────────
+    def _maybe_sample_live_waveforms(self):
+        if self.sim_time < self._next_sample_t:
+            return
+        self._next_sample_t = self.sim_time + 1.0 / self.graph_samples_hz
+
+        omega = 2*math.pi*self.freq
+        # Normalise waveforms to the largest source magnitude (AC or DC)
+        max_src_v = max((abs(c.val) for c in self.circ.comps
+                         if c.ct in (CType.VAC, CType.VDC)), default=1.0)
+
+        for c in self.circ.comps:
+            v_i = self._instant_v_i(c, omega, self.sim_time)
+            if v_i is None:
+                continue
+            v, i = v_i
+            # normalise to max source magnitude (avoid ÷0)
+            nv = v / max_src_v
+            ni = i / max_src_v
+            self.history[(c, 'V')].append((self.sim_time, nv))
+            self.history[(c, 'I')].append((self.sim_time, ni))
+
+    def _instant_v_i(self, c:Comp, omega:float, t:float):
+        """Return instantaneous (V, I) for component *c*
+           or None if we cannot compute it yet."""
+        if self.circ.solution is None or self.circ.solution.size == 0:
+            return None
+        # === voltage exactly like overlay ===
+        net_map = self.circ.nmap
+        node_volt = self.circ.solution[:self.circ.node_cnt]
+
+        def pin_v(p):
+            return (0j if p.net == 0 else node_volt[net_map[p.net]]
+                   ) if p.net in net_map else 0j
+
+        # Instantaneous voltage at *first* pin
+        vp = pin_v(c.pins[0])
+        mag, ph = cmath.polar(vp)
+        v_inst_1 = mag * math.cos(omega*t + ph)
+
+        # Same for the second pin (if any) to get ΔV
+        if len(c.pins) > 1:
+            vn = pin_v(c.pins[1])
+            mag2, ph2 = cmath.polar(vn)
+            v_inst_2 = mag2 * math.cos(omega*t + ph2)
+            v_inst = v_inst_1 - v_inst_2
+        else:
+            v_inst = v_inst_1
+
+        # === current exactly like overlay ===
+        cur_phasor = None
+        if c.ct in (CType.R,CType.C,CType.L) and len(c.pins)==2:
+            # reuse overlay logic
+            p1,p2 = c.pins
+            v1, v2 = vp, vn
+            Z = {CType.R: lambda: max(c.val,1e-12),
+                 CType.C: lambda: (1e30 if omega==0 or c.val==0 else 1/(1j*omega*c.val)),
+                 CType.L: lambda: (R_L_DC_SHORT if omega==0 or c.val==0 else 1j*omega*c.val)}[c.ct]()
+            cur_phasor = (v1 - v2) / Z
+        elif c.ct in (CType.VDC, CType.VAC):
+            idx = self.circ.vsrc_idx.get(c)
+            if idx is not None:
+                cur_phasor = self.circ.solution[self.circ.node_cnt+idx]
+
+        if cur_phasor is None:
+            return v_inst, 0.0
+
+        magI, phI = cmath.polar(cur_phasor)
+        i_inst = magI * math.cos(omega*t + phI)
+        return v_inst, i_inst
+
+    def draw_live_graph_popup(self):
+        if not self.history:
+            return
+
+        popup_w, popup_h = int(WIN_W*0.9), int(WIN_H*0.6)
+        px, py = (WIN_W-popup_w)//2, (WIN_H-popup_h)//2
+        surf = pg.Surface((popup_w, popup_h), pg.SRCALPHA)
+        pg.draw.rect(surf,(30,35,40,240),surf.get_rect(),border_radius=8)
+        pg.draw.rect(surf,(120,140,160,230),surf.get_rect(),2,border_radius=8)
+
+        title = self.font.render("Live waveforms – last 5 s (normalised)",True,(220,220,255))
+        surf.blit(title,title.get_rect(midtop=(popup_w//2,8)))
+
+        # graph area
+        pad = int(40*SIZE_SCALE)
+        gx0, gy0 = pad,  title.get_rect().bottom + pad//2
+        gx1, gy1 = popup_w-pad, popup_h-pad
+        w,  h   = gx1-gx0, gy1-gy0
+
+        # axes
+        pg.draw.line(surf,(90,90,90),(gx0,gy1),(gx1,gy1))
+        pg.draw.line(surf,(90,90,90),(gx0,gy0),(gx0,gy1))
+        # zero-line
+        pg.draw.line(surf,(70,70,70),(gx0,(gy0+gy1)//2),(gx1,(gy0+gy1)//2),1)
+
+        # time scale
+        t_now = self.sim_time
+        t_min = max(0.0, t_now-self.graph_history_s)
+        def x_of(t): return gx0 + (t-t_min)/(self.graph_history_s)*w
+        def y_of(v): return (gy0+gy1)//2 - v* (h/2-4)
+
+        colours = {}
+        colour_cycle = [(255,100,100),(100,200,255),(255,220,120),
+                        (180,255,180),(255,180,255),(160,140,255)]
+        for k in self.history.keys():
+            if k[0] not in colours:
+                colours[k[0]] = colour_cycle[len(colours)%len(colour_cycle)]
+
+        # draw each trace
+        for (comp, kind), dq in self.history.items():
+            col = colours[comp]
+            if kind == 'I':
+                col = tuple(min(255,x+60) for x in col)  # lighter for current
+            pts = [(x_of(t), y_of(v)) for t,v in dq if t>=t_min]
+            if len(pts) > 1:
+                pg.draw.lines(surf,col,False,pts,1)
+
+        # legend
+        lx, ly = gx0, gy0- int(22*SIZE_SCALE)
+        for comp, col in colours.items():
+            name_s = self.font_tiny.render(f"{comp.name}  (V)",True,col)
+            surf.blit(name_s,(lx,ly)); ly-=name_s.get_height()+2
+            name_s = self.font_tiny.render(f"{comp.name}  (I)",True,
+                                           tuple(min(255,x+60) for x in col))
+            surf.blit(name_s,(lx,ly)); ly-=name_s.get_height()+4
+
+        # close hint
+        hint = self.font_small.render("Press G or Esc to close",True,(200,200,200))
+        surf.blit(hint,hint.get_rect(midbottom=(popup_w//2,popup_h-6)))
+
+        self.scr.blit(surf,(px,py))
 
 
 # ───────── main ─────────
